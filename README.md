@@ -1,110 +1,124 @@
-# GPT-5.1 OCR Pipeline
+# VLM OCR Recursive Refinement Pipeline
 
-A production-ready OCR pipeline using GPT-5.1 Vision API for high-accuracy document transcription. Automatically handles tables, rotation, callouts, and produces structured JSON output.
+A Python CLI for OCR-style transcription of PDFs using vision-capable language models. The pipeline renders PDF pages to images, extracts table context with `pdfplumber`, sends each page to a configured model provider, and writes both Markdown and JSON outputs.
 
-## Features
+It supports provider/model selection so the same document workflow can run against compatible OpenAI or Anthropic vision models. Risk notes from the initial pass can feed one or more focused refinement passes.
 
-- **High-Accuracy OCR**: Uses GPT-5.1 with high reasoning effort for precise text transcription
-- **Automatic Table Extraction**: Extracts tables using pdfplumber and provides as context to improve accuracy
-- **Smart Rotation Detection**: Auto-detects and corrects rotated pages
-- **Whitespace Cropping**: Automatically crops pages to maximize content resolution
-- **Risk Verification**: Optional second-pass verification for pages with identified risks
-- **Structured Output**: Produces both JSON (structured) and Markdown (readable) formats
-- **Callout Handling**: Preserves annotations, handwritten notes, and arrows with intent-aware formatting
-- **Progress Tracking**: Real-time progress bars and detailed terminal output
+## What It Does
 
-## Prerequisites
+- Renders each PDF page to a high-resolution PNG with PyMuPDF.
+- Detects simple rotated-page cases and crops large whitespace margins.
+- Extracts table text with `pdfplumber` and passes it as context for the model.
+- Sends rendered page images to a selected provider/model.
+- Requests structured JSON containing page-level Markdown, layout classification, and risk notes.
+- Runs targeted recursive refinement passes when the model reports transcription risk notes.
+- Writes `output.md` for reading and `output.json` for downstream use.
+- Tracks provider API calls, token usage, and configurable cost estimates.
 
-- Python 3.10 or higher
-- OpenAI API key with access to GPT-5.1
-  - Get your API key from [OpenAI Platform](https://platform.openai.com/api-keys)
-  - Ensure your account has access to GPT-5.1 model
+## Supported Providers
+
+The CLI supports:
+
+- `openai` through the OpenAI Responses API.
+- `anthropic` through the Anthropic Messages API.
+
+Use vision-capable models only. Text-only models cannot process the rendered page images.
+
+Reasoning effort is provider and model specific. OpenAI reasoning models use the configured `--effort` value when the model supports it. Anthropic requests currently ignore `--effort` and rely on the selected model's default behavior.
+
+## Requirements
+
+- Python 3.10 or newer
+- An API key for at least one supported provider
+- A PDF file to process
 
 ## Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd gpt51_ocr_pipeline
-   ```
-
-2. **Create a virtual environment (recommended)**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Set up environment variables**
-   
-   Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
-   
-   Edit `.env` and add your OpenAI API key:
-   ```bash
-   OPENAI_API_KEY=sk-your-api-key-here
-   ```
-   
-   Optional: Adjust other settings as needed (see `.env.example` for all options).
-
-## Quick Start
-
-**1. Verify your setup:**
 ```bash
-python3 ocr.py --help
+git clone https://github.com/ntguion/vlm-ocr-recursive-refinement.git
+cd vlm-ocr-recursive-refinement
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-**2. Run OCR on a PDF:**
+Edit `.env` and add the key for the provider you plan to use:
+
 ```bash
-python3 ocr.py --pdf your_document.pdf
+MODEL_PROVIDER=openai
+MODEL=gpt-5.2
+OPENAI_API_KEY=replace-with-openai-key
 ```
 
-This will create `output.md` and `output.json` in the current directory.
+or:
 
-**3. Check the results:**
-- `output.json` - Structured data for programmatic access
-- `output.md` - Human-readable markdown document
-
-**With custom output paths:**
 ```bash
-python3 ocr.py --pdf your_document.pdf --out result.md --json result.json
+MODEL_PROVIDER=anthropic
+MODEL=claude-sonnet-4-6
+ANTHROPIC_API_KEY=replace-with-anthropic-key
 ```
 
-**With custom settings:**
+## Usage
+
+Check the CLI:
+
+```bash
+python ocr.py --help
+```
+
+Run with the default provider/model from `.env`:
+
+```bash
+python ocr.py --pdf document.pdf
+```
+
+Run with OpenAI:
+
 ```bash
 python ocr.py \
+  --provider openai \
+  --model gpt-5.2 \
   --pdf document.pdf \
   --out result.md \
   --json result.json \
-  --model gpt-5.1 \
-  --effort high \
-  --max-output-tokens 16384 \
-  --max-concurrency 8
+  --refinement-passes 2
 ```
 
-## Command Line Options
+Run with Anthropic:
+
+```bash
+python ocr.py \
+  --provider anthropic \
+  --model claude-sonnet-4-6 \
+  --pdf document.pdf \
+  --out result.md \
+  --json result.json
+```
+
+You can also prefix the model with the provider:
+
+```bash
+python ocr.py --model anthropic:claude-sonnet-4-6 --pdf document.pdf
+```
+
+## CLI Options
 
 | Option | Description | Default |
-|--------|-------------|---------|
-| `--pdf` | Path to input PDF file (required) | - |
-| `--out` | Path to Markdown output file | `output.md` |
-| `--json` | Path to JSON output file | `output.json` |
-| `--model` | OpenAI model name | `gpt-5.1` |
-| `--effort` | Reasoning effort level (`low`, `medium`, `high`) | `high` |
-| `--max-output-tokens` | Maximum tokens per page response | `16384` |
-| `--max-concurrency` | Maximum concurrent page processing | `8` |
+|---|---|---|
+| `--pdf` | Path to input PDF file | required |
+| `--out` | Markdown output path | `output.md` |
+| `--json` | JSON output path | `output.json` |
+| `--provider` | `openai`, `anthropic`, or `auto` | `openai` |
+| `--model` | Vision-capable model name, optionally `provider:model` | `gpt-5.2` |
+| `--effort` | Provider/model-specific reasoning effort | `high` |
+| `--max-output-tokens` | Maximum response tokens per page | `16384` |
+| `--max-concurrency` | Maximum pages processed concurrently | `8` |
+| `--refinement-passes` | Maximum issue-targeted refinement passes per page | `1` |
 
-## Output Formats
+## Output
 
-### JSON Output (`output.json`)
-
-Structured data containing all page results:
+`output.json` contains page-level records:
 
 ```json
 {
@@ -112,138 +126,73 @@ Structured data containing all page results:
     {
       "page_number": 1,
       "layout_classification": "letter",
-      "risk_notes": [
-        {
-          "type": "small_font",
-          "location": "header",
-          "description": "Very small text"
-        }
-      ],
-      "final_markdown": "# Document Title\n\nContent..."
+      "risk_notes": [],
+      "final_markdown": "# Document Title\n\nTranscribed content..."
     }
   ],
   "metadata": {
     "source_pdf": "document.pdf",
-    "model": "gpt-5.1"
+    "provider": "openai",
+    "model": "gpt-5.2"
   }
 }
 ```
 
-### Markdown Output (`output.md`)
-
-Human-readable document with pages separated by `-----`:
-
-```markdown
-### Page 1
-
-# Document Title
-
-Content here...
-
------
-### Page 2
-
-More content...
-```
-
-## How It Works
-
-1. **PDF Rendering**: Converts PDF pages to high-resolution PNG images (300 DPI)
-   - Auto-detects vertical text and rotates pages
-   - Crops whitespace to maximize content resolution
-
-2. **Table Extraction**: For each page, extracts tables using pdfplumber
-   - Provides "source of truth" data to improve LLM accuracy
-   - Falls back to text-based extraction for complex layouts
-
-3. **OCR Processing**: Sends page images to GPT-5.1 Vision API
-   - Uses high reasoning effort for accuracy
-   - Processes multiple pages concurrently (configurable)
-
-4. **Risk Verification**: Optional second pass for pages with identified risks
-   - Focuses on specific problem areas
-   - Verifies and corrects transcription errors
-
-5. **Output Generation**: Produces both JSON and Markdown formats
-   - JSON for programmatic access
-   - Markdown for human readability
-
-## API Calls Per Page
-
-- **Normal case**: 1 API call (primary OCR)
-- **With risks**: 2 API calls (primary + verification)
-- **With JSON repair**: Up to 3 API calls (primary + repair + optional verification)
-
-## Cost Estimation
-
-The pipeline tracks token usage and provides cost estimates based on your `.env` pricing:
-
-```
-💰 Estimated cost:       $X.XXXX
-   (Input: $1.25/M, Output: $10.0/M)
-```
-
-Update `INPUT_PRICE_PER_MTOK` and `OUTPUT_PRICE_PER_MTOK` in `.env` to match current pricing.
-
-## Troubleshooting
-
-**Issue: "OPENAI_API_KEY is not set"**
-- Make sure you've created a `.env` file in the project root
-- Copy `.env.example` to `.env` and add your API key
-- Verify the key starts with `sk-`
-
-**Issue: "Python 3.10 or higher is required"**
-- Install Python 3.10+ from [python.org](https://www.python.org/downloads/)
-- Verify with: `python3 --version`
-
-**Issue: "PDF file not found"**
-- Check that the file path is correct
-- Use absolute paths if relative paths don't work
-- Ensure the file has `.pdf` extension
-
-**Issue: Pages are rotated incorrectly**
-- The pipeline auto-detects rotation, but if issues persist, check the PDF metadata
-
-**Issue: Tables are inaccurate**
-- The pipeline uses pdfplumber for table extraction. If tables are still wrong, the PDF may have complex layouts that require manual review
-
-**Issue: Token limit exceeded**
-- Increase `--max-output-tokens` (default: 16384)
-- Very dense pages may need higher limits
-
-**Issue: Rate limiting**
-- Reduce `--max-concurrency` (default: 8)
-- The pipeline includes automatic retries with exponential backoff
-
-**Issue: Import errors**
-- Make sure you've activated your virtual environment
-- Reinstall dependencies: `pip install -r requirements.txt`
+`output.md` contains the final page transcriptions separated by page markers.
 
 ## Project Structure
 
+```text
+.
+├── AGENTS.md          # Contributor guidance for local changes
+├── ocr.py              # CLI and VLM/OCR refinement orchestration
+├── llm_providers.py    # OpenAI and Anthropic provider adapters
+├── prompts.py          # OCR and verification prompts
+├── table_extractor.py  # pdfplumber table context extraction
+├── requirements.txt
+├── .env.example
+├── tests/
+└── README.md
 ```
-gpt51_ocr_pipeline/
-├── ocr.py              # Main pipeline script
-├── prompts.py          # LLM prompt templates
-├── table_extractor.py  # Table extraction module
-├── requirements.txt    # Python dependencies
-├── .env.example        # Environment variables template
-├── .env                # Your environment variables (create from .env.example)
-├── README.md           # This file
-└── .gitignore          # Git ignore rules
+
+## Development Notes
+
+See `AGENTS.md` for repository conventions, validation commands, provider-extension guidance, and data-handling expectations.
+
+## Validation
+
+Run syntax checks:
+
+```bash
+python -m py_compile ocr.py llm_providers.py prompts.py table_extractor.py
 ```
+
+Run unit tests:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Live OCR tests require a real API key and a synthetic or non-sensitive PDF.
+
+## Limitations
+
+- OCR quality depends on the chosen model, image clarity, document density, and provider image handling.
+- The project does not include a benchmark or accuracy guarantee.
+- Recursive refinement is model-guided and should not replace human review for high-stakes documents.
+- Provider pricing and model support change over time; update `.env` cost settings as needed.
+- The CLI sends rendered page images to the selected provider. Do not process sensitive PDFs unless that provider and account configuration are appropriate for the data.
+- There is no packaged release, hosted service, access control, queueing, monitoring, or retry persistence.
+
+## Production Hardening Ideas
+
+- Add synthetic PDF fixtures and regression tests for common layouts.
+- Add model-by-model evaluation against known transcriptions.
+- Add resumable processing for large PDFs.
+- Add structured-output mode per provider where available.
+- Add safer defaults for concurrency and output directory management.
+- Add CI for linting, tests, and secret scanning.
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Contributing
-
-1. Follow existing code style
-2. Add docstrings to all functions
-3. Test with various PDF types
-4. Update README if adding features
-
-## Support
-
-For issues or questions, please open an issue on GitHub.
+MIT. See `LICENSE`.

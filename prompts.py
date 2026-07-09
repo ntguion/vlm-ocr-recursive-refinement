@@ -1,5 +1,5 @@
 """
-Prompt Templates for GPT-5.1 OCR Pipeline
+Prompt templates for the VLM OCR refinement pipeline.
 
 Contains system and user prompts optimized for accurate OCR transcription
 with support for callouts, annotations, and structured output.
@@ -88,7 +88,7 @@ If the page shows a letter starting with "Dear John," your final_markdown should
     """
 
 VERIFICATION_PROMPT_TEMPLATE = """
-You are a specialist OCR Verification Agent.
+You are a specialist OCR Refinement Agent.
 Your task is to verify and fix specific issues in a page transcription.
 
 INPUT DATA:
@@ -109,12 +109,15 @@ YOUR INSTRUCTIONS:
 4. If there are errors (typos, missing text, wrong numbers), FIX THEM to match the image exactly.
 5. If text is truly illegible, verify that "???" is used.
 6. Return the FULL corrected markdown.
+7. Include remaining risk notes only for unresolved issues that need another refinement pass.
 
 OUTPUT SCHEMA:
 Return a JSON object with:
 - page_number: {page_number}
+- refinement_pass: {refinement_pass}
 - verification_status: "verified" or "corrected"
 - changes_made: string (brief description of what you fixed, or "None")
+- risk_notes: array of unresolved risk note objects, or [] if no unresolved risk remains
 - final_markdown: string (the full, corrected markdown)
 
 Return ONLY the JSON object.

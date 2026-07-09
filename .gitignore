@@ -18,9 +18,20 @@ ENV/
 # Output files
 output.md
 output.json
+outputs/
+results/
+*.log
+*.tmp
 *.png
 *.jpg
 *.jpeg
+*.pdf
+*.ppt
+*.pptx
+*.db
+*.sqlite
+*.sqlite3
+*.csv
 
 # IDE
 .vscode/
@@ -33,6 +44,6 @@ output.json
 .DS_Store
 Thumbs.db
 
-# Test PDFs (add your own)
-# testPDF.pdf
-
+# Local test inputs and generated artifacts
+test_inputs/
+test_outputs/

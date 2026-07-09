@@ -144,14 +144,20 @@ python ocr.py --model anthropic:claude-sonnet-4-6 --pdf document.pdf
 
 ```text
 .
+├── AGENTS.md          # Contributor guidance for local changes
 ├── ocr.py              # CLI and VLM/OCR refinement orchestration
 ├── llm_providers.py    # OpenAI and Anthropic provider adapters
 ├── prompts.py          # OCR and verification prompts
 ├── table_extractor.py  # pdfplumber table context extraction
 ├── requirements.txt
 ├── .env.example
+├── tests/
 └── README.md
 ```
+
+## Development Notes
+
+See `AGENTS.md` for repository conventions, validation commands, provider-extension guidance, and data-handling expectations.
 
 ## Validation
 

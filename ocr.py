@@ -1,12 +1,8 @@
 """
-GPT-5.1 OCR Pipeline
+Model-configurable OCR pipeline.
 
-A production-ready OCR pipeline using GPT-5.1 Vision API for high-accuracy
-document transcription. Features automatic table extraction, rotation detection,
-risk verification, and structured JSON output.
-
-Author: Your Team
-License: MIT
+Renders PDF pages, extracts table context, sends page images to a configured
+vision model provider, and writes structured JSON plus readable Markdown.
 """
 
 import os
@@ -25,8 +21,12 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from openai import AsyncOpenAI
-
+from llm_providers import (
+    OCRModelProvider,
+    ProviderConfigurationError,
+    create_provider,
+    resolve_provider_and_model,
+)
 import prompts
 import table_extractor
 
@@ -244,25 +244,23 @@ class TransientError(Exception):
 
 # ---------- Model invocation ----------
 
-def build_user_message(page_number: int, table_context: Optional[str] = None) -> List[dict]:
+def build_user_prompt(page_number: int, table_context: Optional[str] = None) -> str:
     """
-    Build the user message content for the API call.
+    Build the user prompt for the model call.
     
     Args:
         page_number: Page number being processed
         table_context: Optional extracted table data to include as context
         
     Returns:
-        List of message content dictionaries for OpenAI API
+        User prompt text
     """
     text_content = prompts.USER_PROMPT_TEMPLATE.format(page_number=page_number)
     
     if table_context:
         text_content += "\n\n" + table_context
         
-    return [
-        {"type": "input_text", "text": text_content}
-    ]
+    return text_content
 
 @retry(
     reraise=True,
@@ -271,7 +269,7 @@ def build_user_message(page_number: int, table_context: Optional[str] = None) ->
     retry=retry_if_exception_type(TransientError),
 )
 async def call_model_one_page(
-    client: AsyncOpenAI,
+    provider: OCRModelProvider,
     model: str,
     image_data_url: str,
     page_number: int,
@@ -281,17 +279,17 @@ async def call_model_one_page(
     table_context: Optional[str] = None,
 ) -> Tuple[PageResult, UsageTotals]:
     """
-    Process a single page through GPT-5.1 Vision API.
+    Process a single page through the configured vision model provider.
     
     Handles API calls, JSON parsing, truncation detection, and error recovery.
     Returns PageResult with transcription and usage statistics.
     
     Args:
-        client: AsyncOpenAI client instance
-        model: Model name (e.g., "gpt-5.1")
+        provider: Model provider adapter
+        model: Model name
         image_data_url: Base64-encoded PNG data URL
         page_number: Page number being processed
-        reasoning_effort: Reasoning effort level ("low", "medium", "high")
+        reasoning_effort: Provider/model-specific reasoning effort
         max_output_tokens: Maximum tokens for response
         progress_callback: Optional callback for progress updates
         table_context: Optional extracted table data
@@ -303,63 +301,39 @@ async def call_model_one_page(
         TransientError: For retryable API errors
         JsonNotReturnedError: If JSON parsing fails after repair attempts
     """
-    input_list = [
-        {
-            "role": "user",
-            "content": build_user_message(page_number, table_context) + [
-                {"type": "input_image", "image_url": image_data_url}
-            ],
-        }
-    ]
-    
     if progress_callback:
-        progress_callback(f"📤 Page {page_number}: Sending to API...")
+        progress_callback(f"📤 Page {page_number}: Sending to {provider.name}...")
     
     try:
         start_time = time.time()
-        resp = await client.responses.create(
+        provider_response = await provider.complete_with_image(
+            system_prompt=prompts.SYSTEM_PROMPT,
+            user_prompt=build_user_prompt(page_number, table_context),
+            image_data_url=image_data_url,
             model=model,
-            reasoning={"effort": reasoning_effort},
-            instructions=prompts.SYSTEM_PROMPT,
-            input=input_list,
+            reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
         )
         elapsed = time.time() - start_time
         if progress_callback:
-            progress_callback(f"✅ Page {page_number}: API response received ({elapsed:.1f}s)")
+            progress_callback(f"✅ Page {page_number}: Provider response received ({elapsed:.1f}s)")
     except Exception as e:
         if progress_callback:
-            progress_callback(f"❌ Page {page_number}: API error - {str(e)}")
+            progress_callback(f"❌ Page {page_number}: Provider error - {str(e)}")
         raise TransientError(str(e))
 
     usage = UsageTotals()
     usage.add_api_call(call_type="primary")
-    if getattr(resp, "usage", None) is not None:
-        usage.add(resp.usage)
+    usage.add(provider_response.usage)
     
     # Check for truncation
-    output_tokens = int(getattr(resp.usage, "output_tokens", 0) or 0) if getattr(resp, "usage", None) else 0
-    is_truncated = output_tokens >= max_output_tokens
+    output_tokens = provider_response.usage.output_tokens
+    is_truncated = provider_response.truncated or output_tokens >= max_output_tokens
     if is_truncated and progress_callback:
         progress_callback(f"⚠️  Page {page_number}: Response may be truncated (hit {max_output_tokens:,} token limit)")
 
     # Try to parse JSON directly
-    text_out = ""
-    try:
-        # Preferred helper in the SDK
-        text_out = resp.output_text  # type: ignore[attr-defined]
-    except Exception:
-        # Fallback gather
-        try:
-            # Best effort: accumulate all text parts
-            parts = []
-            for item in getattr(resp, "output", []) or []:
-                for c in getattr(item, "content", []) or []:
-                    if getattr(c, "type", "") in ("output_text", "text"):
-                        parts.append(getattr(c, "text", ""))
-            text_out = "\n".join(parts)
-        except Exception:
-            text_out = ""
+    text_out = provider_response.text
 
     data = extract_first_json_object(text_out) if text_out else None
     
@@ -407,24 +381,19 @@ async def call_model_one_page(
                 f"{text_out}"
             )
             start_time = time.time()
-            resp2 = await client.responses.create(
+            repair_response = await provider.complete_text(
+                system_prompt="Return valid JSON only. No prose.",
+                user_prompt=repair_prompt,
                 model=model,
-                reasoning={"effort": "low"},
-                instructions="Return valid JSON only. No prose.",
-                input=[{"role": "user", "content": [{"type": "input_text", "text": repair_prompt}]}],
+                reasoning_effort="low",
                 max_output_tokens=1024,
             )
             elapsed = time.time() - start_time
             usage.add_api_call(call_type="repair")
-            if getattr(resp2, "usage", None) is not None:
-                usage.add(resp2.usage)
+            usage.add(repair_response.usage)
             if progress_callback:
                 progress_callback(f"✅ Page {page_number}: Repair call completed ({elapsed:.1f}s)")
-            repaired = ""
-            try:
-                repaired = resp2.output_text  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            repaired = repair_response.text
             data = extract_first_json_object(repaired) if repaired else None
         except Exception as e:
             if progress_callback:
@@ -456,12 +425,13 @@ async def call_model_one_page(
     return result, usage
 
 async def verify_and_fix_page(
-    client: AsyncOpenAI,
+    provider: OCRModelProvider,
     model: str,
     image_data_url: str,
     page_result: PageResult,
     reasoning_effort: str,
     max_output_tokens: int,
+    refinement_pass: int,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[PageResult, UsageTotals]:
     """
@@ -471,12 +441,13 @@ async def verify_and_fix_page(
     the image with the transcription to correct errors in identified areas.
     
     Args:
-        client: AsyncOpenAI client instance
+        provider: Model provider adapter
         model: Model name
         image_data_url: Base64-encoded PNG data URL
         page_result: Initial OCR result with risk notes
         reasoning_effort: Reasoning effort level
         max_output_tokens: Maximum tokens for response
+        refinement_pass: Current refinement pass number
         progress_callback: Optional callback for progress updates
         
     Returns:
@@ -495,55 +466,36 @@ async def verify_and_fix_page(
         return page_result, UsageTotals()
 
     if progress_callback:
-        progress_callback(f"🔍 Page {page_result.page_number}: Verifying {len(risks_to_check)} risk(s)...")
+        progress_callback(
+            f"🔍 Page {page_result.page_number}: Refinement pass {refinement_pass} "
+            f"for {len(risks_to_check)} risk(s)..."
+        )
 
     risk_text = "\n".join([f"- [{r.get('type', 'unknown')}] {r.get('location', 'unknown')}: {r.get('description', '')}" for r in risks_to_check])
     
     prompt_text = prompts.VERIFICATION_PROMPT_TEMPLATE.format(
+        refinement_pass=refinement_pass,
         page_number=page_result.page_number,
         current_markdown=page_result.final_markdown,
         risk_notes_text=risk_text
     )
 
-    input_list = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt_text},
-                {"type": "input_image", "image_url": image_data_url}
-            ],
-        }
-    ]
-
     usage = UsageTotals()
     
     try:
-        resp = await client.responses.create(
+        provider_response = await provider.complete_with_image(
+            system_prompt="You are a helpful verification assistant.",
+            user_prompt=prompt_text,
+            image_data_url=image_data_url,
             model=model,
-            reasoning={"effort": "medium"}, # Use medium effort for verification
-            instructions="You are a helpful verification assistant.",
-            input=input_list,
+            reasoning_effort="medium",
             max_output_tokens=max_output_tokens,
         )
         
         usage.add_api_call(call_type="verification")
-        if getattr(resp, "usage", None) is not None:
-            usage.add(resp.usage)
-
-        text_out = ""
-        try:
-            text_out = resp.output_text # type: ignore
-        except Exception:
-            try:
-                parts = []
-                for item in getattr(resp, "output", []) or []:
-                    for c in getattr(item, "content", []) or []:
-                         if getattr(c, "type", "") in ("output_text", "text"):
-                             parts.append(getattr(c, "text", ""))
-                text_out = "\n".join(parts)
-            except:
-                text_out = ""
+        usage.add(provider_response.usage)
         
+        text_out = provider_response.text
         data = extract_first_json_object(text_out)
         if data and "final_markdown" in data:
             new_markdown = str(data["final_markdown"])
@@ -554,6 +506,7 @@ async def verify_and_fix_page(
                 progress_callback(f"✅ Page {page_result.page_number}: Verified ({status}). Changes: {changes}")
             
             page_result.final_markdown = new_markdown
+            page_result.risk_notes = list(data.get("risk_notes", []))
             
     except Exception as e:
         if progress_callback:
@@ -567,21 +520,26 @@ async def process_pdf(
     pdf_path: str,
     output_md_path: str,
     output_json_path: str,
+    provider_name: str,
+    provider: OCRModelProvider,
     model: str,
     reasoning_effort: str,
     max_output_tokens: int,
     max_concurrency: int,
+    refinement_passes: int,
     input_price_per_mtok: float,
     output_price_per_mtok: float,
 ):
     print("=" * 70)
-    print("🚀 GPT-5.1 OCR Pipeline - Starting Processing")
+    print("🚀 Model-Configurable OCR Pipeline - Starting Processing")
     print("=" * 70)
     print(f"📄 PDF: {pdf_path}")
     print(f"📝 Output: {output_md_path}")
+    print(f"🔌 Provider: {provider_name}")
     print(f"🤖 Model: {model}")
     print(f"⚙️  Reasoning Effort: {reasoning_effort}")
     print(f"🔢 Max Concurrency: {max_concurrency}")
+    print(f"🔁 Refinement Passes: {refinement_passes}")
     print(f"📊 Max Output Tokens: {max_output_tokens:,}")
     print("-" * 70)
     
@@ -591,10 +549,6 @@ async def process_pdf(
     total_pages = len(images)
     render_time = time.time() - start_time
     print(f"✅ Rendered {total_pages} page(s) in {render_time:.2f}s (300 DPI)")
-
-    # Initialize OpenAI client (API key already validated in main())
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    client = AsyncOpenAI(api_key=api_key)
 
     semaphore = asyncio.Semaphore(max_concurrency)
     usage_totals = UsageTotals()
@@ -625,7 +579,7 @@ async def process_pdf(
         async with semaphore:
             try:
                 page_result, usage = await call_model_one_page(
-                    client,
+                    provider,
                     model=model,
                     image_data_url=data_url,
                     page_number=page_number,
@@ -635,19 +589,17 @@ async def process_pdf(
                     table_context=table_context,
                 )
                 
-                # Verification Step
-                if page_result.risk_notes:
+                for refinement_pass in range(1, refinement_passes + 1):
+                    if not page_result.risk_notes:
+                        break
                     page_result, verify_usage = await verify_and_fix_page(
-                        client,
+                        provider,
                         model=model,
                         image_data_url=data_url,
                         page_result=page_result,
-                        reasoning_effort="medium", # Use medium effort for verification to save costs/time unless high is needed? Let's default to medium or same.
-                                                   # Actually, let's stick to high if the main pass was high, or maybe medium is enough. 
-                                                   # The prompt says "expert-level", let's keep it robust. 
-                                                   # Let's use the passed 'reasoning_effort' but maybe cap it or just use it.
-                        # Let's use "medium" for verification to balance cost/speed since we have specific targets.
+                        reasoning_effort="medium",
                         max_output_tokens=max_output_tokens,
+                        refinement_pass=refinement_pass,
                         progress_callback=progress_callback,
                     )
                     usage.add(verify_usage)
@@ -708,7 +660,18 @@ async def process_pdf(
             json_output.append(None)
             
     with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump({"pages": json_output, "metadata": {"source_pdf": pdf_path, "model": model}}, f, indent=2)
+        json.dump(
+            {
+                "pages": json_output,
+                "metadata": {
+                    "source_pdf": pdf_path,
+                    "provider": provider_name,
+                    "model": model,
+                },
+            },
+            f,
+            indent=2,
+        )
     print(f"✅ JSON written successfully")
 
     # 2. Write Markdown Output (Readable Document)
@@ -769,27 +732,43 @@ def parse_args():
         Parsed arguments namespace
     """
     p = argparse.ArgumentParser(
-        description="GPT-5.1 OCR Pipeline: High-accuracy document transcription",
+        description="VLM OCR recursive refinement pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python ocr.py --pdf document.pdf
-  python ocr.py --pdf doc.pdf --out result.md --json result.json --effort high
+  python ocr.py --provider openai --model gpt-5.2 --pdf doc.pdf
+  python ocr.py --provider anthropic --model claude-sonnet-4-6 --pdf doc.pdf
+  python ocr.py --pdf dense.pdf --refinement-passes 3
+  python ocr.py --model anthropic:claude-sonnet-4-6 --pdf doc.pdf
         """
     )
     p.add_argument("--pdf", required=True, help="Path to input PDF file")
     p.add_argument("--out", default="output.md", help="Path to Markdown output file (default: output.md)")
     p.add_argument("--json", default="output.json", help="Path to JSON output file (default: output.json)")
-    p.add_argument("--model", default=os.getenv("MODEL", "gpt-5.1"), help="OpenAI model name (default: gpt-5.1)")
-    p.add_argument("--effort", default=os.getenv("REASONING_EFFORT", "high"), 
-                   choices=["low", "medium", "high"], 
-                   help="Reasoning effort level (default: high)")
+    p.add_argument(
+        "--provider",
+        default=os.getenv("MODEL_PROVIDER", "openai"),
+        choices=["auto", "openai", "anthropic"],
+        help="Model provider (default: openai)",
+    )
+    p.add_argument(
+        "--model",
+        default=os.getenv("MODEL", "gpt-5.2"),
+        help="Vision-capable model name, optionally prefixed as provider:model (default: gpt-5.2)",
+    )
+    p.add_argument("--effort", default=os.getenv("REASONING_EFFORT", "high"),
+                   choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+                   help="Provider/model-specific reasoning effort (default: high)")
     p.add_argument("--max-output-tokens", type=int, 
                    default=int(os.getenv("MAX_OUTPUT_TOKENS", "16384")), 
                    help="Maximum output tokens per page (default: 16384)")
     p.add_argument("--max-concurrency", type=int, 
                    default=int(os.getenv("MAX_CONCURRENCY", "8")), 
                    help="Maximum concurrent page processing (default: 8)")
+    p.add_argument("--refinement-passes", type=int,
+                   default=int(os.getenv("REFINEMENT_PASSES", "1")),
+                   help="Maximum issue-targeted refinement passes per page (default: 1)")
     return p.parse_args()
 
 def main():
@@ -815,18 +794,27 @@ def main():
     if not args.pdf.lower().endswith('.pdf'):
         print(f"WARNING: File does not have .pdf extension: {args.pdf}", file=sys.stderr)
 
-    # Check API key
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY is not set in .env file", file=sys.stderr)
-        print("Please create a .env file with your OpenAI API key. See .env.example for reference.", file=sys.stderr)
+    if args.refinement_passes < 0:
+        print("ERROR: --refinement-passes must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        provider_name, model = resolve_provider_and_model(args.provider, args.model)
+        provider = create_provider(provider_name)
+    except ProviderConfigurationError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     
-    if not api_key.startswith("sk-"):
+    if provider_name == "openai" and not os.getenv("OPENAI_API_KEY", "").strip().startswith("sk-"):
         print("WARNING: API key format may be incorrect (should start with 'sk-')", file=sys.stderr)
 
-    input_price = float(os.getenv("INPUT_PRICE_PER_MTOK", "1.25"))
-    output_price = float(os.getenv("OUTPUT_PRICE_PER_MTOK", "10.0"))
+    provider_prefix = provider_name.upper()
+    input_price = float(
+        os.getenv(f"{provider_prefix}_INPUT_PRICE_PER_MTOK", os.getenv("INPUT_PRICE_PER_MTOK", "1.25"))
+    )
+    output_price = float(
+        os.getenv(f"{provider_prefix}_OUTPUT_PRICE_PER_MTOK", os.getenv("OUTPUT_PRICE_PER_MTOK", "10.0"))
+    )
 
     # Ensure output directories exist
     out_dir = os.path.dirname(os.path.abspath(args.out)) or "."
@@ -839,10 +827,13 @@ def main():
         pdf_path=args.pdf,
         output_md_path=args.out,
         output_json_path=args.json,
-        model=args.model,
+        provider_name=provider_name,
+        provider=provider,
+        model=model,
         reasoning_effort=args.effort,
         max_output_tokens=args.max_output_tokens,
         max_concurrency=args.max_concurrency,
+        refinement_passes=args.refinement_passes,
         input_price_per_mtok=input_price,
         output_price_per_mtok=output_price,
     ))

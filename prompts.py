@@ -32,6 +32,11 @@ HANDLING CALLOUTS & ANNOTATIONS:
 - Preserve the meaning: If a number is crossed out and replaced, show both: `~~old~~ new`, if a callout references specific rows in a table, denote it like: `[Callout: text pointing to row X]`.
 - again this is the only place where we add something beyond the text in the image to preserve meaning in markdown format
 
+COMPLEX STRUCTURES:
+- Identify timelines, Gantt charts, flowcharts, and multi-column layouts before transcribing.
+- Represent timelines and Gantt charts as Markdown tables with time periods in columns and activities in rows.
+- Flag structures that cannot be represented confidently with a `complex_structure` risk note.
+
 STYLE GUIDE & FORMATTING:
 - **Headings**: Use `#`, `##`, `###` based on visual hierarchy.
 - **Tables**: Use Markdown tables `| col | col |`. If a table is complex, simplify to the best grid representation.
@@ -66,16 +71,18 @@ TRANSCRIPTION PROCESS:
 OUTPUT SCHEMA:
 Return EXACTLY ONE JSON object with these keys:
 - page_number: {page_number} (integer)
-- layout_classification: one of ["letter", "structured_form", "dense_table", "work_auth_sheet", "other"]
+- layout_classification: one of ["letter", "structured_form", "dense_table", "work_auth_sheet", "timeline", "gantt_chart", "flowchart", "multi_column", "other"]
 - risk_notes: array of objects (can be empty) with:
-    - type: string (e.g., "handwriting", "small_font", "overlapping_text", "damaged_scan", "low_contrast")
+    - type: string (e.g., "handwriting", "small_font", "overlapping_text", "damaged_scan", "low_contrast", "complex_structure")
     - location: string (e.g., "bottom-right table", "line 3")
     - description: string (brief explanation)
 - final_markdown: string (the complete OCR transcription in Markdown format)
 
 MARKDOWN TRANSCRIPTION RULES:
+- First identify the overall layout, especially timelines, Gantt charts, flowcharts, and multi-column pages
 - Use # for main headings, ## for subheadings, ### for sub-subheadings
 - Use Markdown tables (| col1 | col2 |) for any grid-like structure
+- For timelines and Gantt charts, use time periods as columns and activities as rows; mark every period an activity spans
 - Preserve line breaks and spacing to match the original layout
 - Keep all numbers, dates, and amounts exactly as written (no formatting changes)
 - Use "???" for any illegible characters or words

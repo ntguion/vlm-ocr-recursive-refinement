@@ -1,19 +1,21 @@
 # VLM OCR Recursive Refinement Pipeline
 
-A Python CLI for OCR-style transcription of PDFs using vision-capable language models. The pipeline renders PDF pages to images, extracts table context with `pdfplumber`, sends each page to a configured model provider, and writes both Markdown and JSON outputs.
+A Python CLI for OCR-style transcription of PDFs and PowerPoint presentations using vision-capable language models. The pipeline renders document pages to images, extracts table context from source PDFs with `pdfplumber`, sends each page to a configured model provider, and writes both Markdown and JSON outputs.
 
 It supports provider/model selection so the same document workflow can run against compatible OpenAI or Anthropic vision models. Risk notes from the initial pass can feed one or more focused refinement passes.
 
 ## What It Does
 
 - Renders each PDF page to a high-resolution PNG with PyMuPDF.
+- Converts `.ppt` and `.pptx` files to temporary PDFs with LibreOffice, renders the slides, and removes the temporary files.
 - Detects simple rotated-page cases and crops large whitespace margins.
 - Extracts table text with `pdfplumber` and passes it as context for the model.
 - Sends rendered page images to a selected provider/model.
 - Requests structured JSON containing page-level Markdown, layout classification, and risk notes.
 - Runs targeted recursive refinement passes when the model reports transcription risk notes.
+- Gives timelines and Gantt charts explicit structure-preservation guidance.
 - Writes `output.md` for reading and `output.json` for downstream use.
-- Tracks provider API calls, token usage, and configurable cost estimates.
+- Records refinement convergence, provider API calls, token usage, and configurable cost estimates.
 
 ## Supported Providers
 
@@ -30,7 +32,8 @@ Reasoning effort is provider and model specific. OpenAI reasoning models use the
 
 - Python 3.10 or newer
 - An API key for at least one supported provider
-- A PDF file to process
+- A PDF or PowerPoint file to process
+- LibreOffice for `.ppt` and `.pptx` input; PDF input does not require it
 
 ## Installation
 
@@ -67,10 +70,16 @@ Check the CLI:
 python ocr.py --help
 ```
 
-Run with the default provider/model from `.env`:
+Run a PDF with the default provider/model from `.env`:
 
 ```bash
-python ocr.py --pdf document.pdf
+python ocr.py --file document.pdf
+```
+
+Run a PowerPoint presentation after installing LibreOffice:
+
+```bash
+python ocr.py --file presentation.pptx
 ```
 
 Run with OpenAI:
@@ -79,7 +88,7 @@ Run with OpenAI:
 python ocr.py \
   --provider openai \
   --model gpt-5.2 \
-  --pdf document.pdf \
+  --file document.pdf \
   --out result.md \
   --json result.json \
   --refinement-passes 2
@@ -91,7 +100,7 @@ Run with Anthropic:
 python ocr.py \
   --provider anthropic \
   --model claude-sonnet-4-6 \
-  --pdf document.pdf \
+  --file document.pdf \
   --out result.md \
   --json result.json
 ```
@@ -99,14 +108,17 @@ python ocr.py \
 You can also prefix the model with the provider:
 
 ```bash
-python ocr.py --model anthropic:claude-sonnet-4-6 --pdf document.pdf
+python ocr.py --model anthropic:claude-sonnet-4-6 --file document.pdf
 ```
+
+The older `--pdf document.pdf` form remains available as a deprecated alias.
 
 ## CLI Options
 
 | Option | Description | Default |
 |---|---|---|
-| `--pdf` | Path to input PDF file | required |
+| `--file` | Path to an input `.pdf`, `.ppt`, or `.pptx` file | required unless `--pdf` is used |
+| `--pdf` | Deprecated PDF-only alias for `--file` | optional |
 | `--out` | Markdown output path | `output.md` |
 | `--json` | JSON output path | `output.json` |
 | `--provider` | `openai`, `anthropic`, or `auto` | `openai` |
@@ -127,18 +139,35 @@ python ocr.py --model anthropic:claude-sonnet-4-6 --pdf document.pdf
       "page_number": 1,
       "layout_classification": "letter",
       "risk_notes": [],
-      "final_markdown": "# Document Title\n\nTranscribed content..."
+      "final_markdown": "# Document Title\n\nTranscribed content...",
+      "refinement_passes_executed": 0,
+      "refinement_converged": true
     }
   ],
   "metadata": {
-    "source_pdf": "document.pdf",
+    "source_file": "document.pdf",
+    "source_type": "pdf",
     "provider": "openai",
-    "model": "gpt-5.2"
+    "model": "gpt-5.2",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 0,
+      "api_calls": 0,
+      "repair_calls": 0,
+      "refinement_calls": 0
+    },
+    "cost_estimate": 0.0,
+    "input_price_per_mtok": 1.75,
+    "output_price_per_mtok": 14.0
   }
 }
 ```
 
 `output.md` contains the final page transcriptions separated by page markers.
+
+The JSON stores only the source filename, not its full local path. Cost values are estimates based on the rates configured in `.env`. The example OpenAI rates match the [published `gpt-5.2` token prices](https://developers.openai.com/api/docs/models/gpt-5.2) at the time of this update; change them when selecting another model or when pricing changes.
 
 ## Project Structure
 
@@ -173,7 +202,7 @@ Run unit tests:
 python -m unittest discover -s tests
 ```
 
-Live OCR tests require a real API key and a synthetic or non-sensitive PDF.
+Live OCR tests require a real API key and a synthetic or non-sensitive document.
 
 ## Limitations
 
@@ -181,7 +210,9 @@ Live OCR tests require a real API key and a synthetic or non-sensitive PDF.
 - The project does not include a benchmark or accuracy guarantee.
 - Recursive refinement is model-guided and should not replace human review for high-stakes documents.
 - Provider pricing and model support change over time; update `.env` cost settings as needed.
-- The CLI sends rendered page images to the selected provider. Do not process sensitive PDFs unless that provider and account configuration are appropriate for the data.
+- The CLI sends rendered page images to the selected provider. Do not process sensitive documents unless that provider and account configuration are appropriate for the data.
+- PowerPoint input requires LibreOffice. The pipeline intentionally does not use a text-only fallback because it would discard slide layout and images.
+- Table context extraction runs only for source PDFs; PowerPoint slides rely on the rendered slide image.
 - There is no packaged release, hosted service, access control, queueing, monitoring, or retry persistence.
 
 ## Production Hardening Ideas
@@ -191,7 +222,7 @@ Live OCR tests require a real API key and a synthetic or non-sensitive PDF.
 - Add resumable processing for large PDFs.
 - Add structured-output mode per provider where available.
 - Add safer defaults for concurrency and output directory management.
-- Add CI for linting, tests, and secret scanning.
+- Add secret scanning and dependency auditing to CI.
 
 ## License
 

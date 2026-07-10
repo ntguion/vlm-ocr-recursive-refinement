@@ -30,7 +30,7 @@ def extract_table_context(pdf_path: str, page_number: int) -> Optional[str]:
             if not tables:
                 return None
             
-            context_str = f"### DETECTED TABLE CONTENT (Source of Truth)\n"
+            context_str = "### DETECTED TABLE CONTENT (Source of Truth)\n"
             context_str += "Use the following extracted table data to verify text, numbers, and structure.\n"
             context_str += "Note: The extraction might be imperfect, but the numbers and text are generally reliable.\n\n"
             
@@ -61,4 +61,3 @@ def extract_table_context(pdf_path: str, page_number: int) -> Optional[str]:
     except Exception as e:
         print(f"Warning: Table extraction failed for page {page_number}: {e}")
         return None
-

@@ -12,8 +12,12 @@ import json
 import base64
 import argparse
 import asyncio
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import fitz  # PyMuPDF
@@ -64,14 +68,28 @@ def extract_first_json_object(text: str) -> Optional[dict]:
     except Exception:
         pass
 
-    # Fallback: find first balanced {...}
+    # Fallback: find the first balanced object while ignoring braces inside
+    # JSON strings. OCR text frequently contains literal braces.
     start = text.find("{")
     if start == -1:
         return None
-    # Track braces
+
     depth = 0
+    in_string = False
+    escaped = False
     for i, ch in enumerate(text[start:], start=start):
-        if ch == "{":
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
@@ -86,7 +104,84 @@ def extract_first_json_object(text: str) -> Optional[dict]:
 class JSONRepairError(Exception):
     pass
 
-# ---------- PDF rendering ----------
+# ---------- Document rendering ----------
+
+PRESENTATION_EXTENSIONS = {".ppt", ".pptx"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", *PRESENTATION_EXTENSIONS}
+
+
+def _find_libreoffice() -> Optional[str]:
+    """Return an available LibreOffice executable, if one is installed."""
+    candidates = [
+        "libreoffice",
+        "soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/opt/homebrew/bin/soffice",
+    ]
+    for candidate in candidates:
+        if os.path.isabs(candidate):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def render_presentation_to_images(presentation_path: str, dpi: int = 300) -> List[bytes]:
+    """Convert a PowerPoint file to a temporary PDF, render it, and clean up."""
+    source_path = Path(presentation_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Presentation not found: {presentation_path}")
+
+    libreoffice = _find_libreoffice()
+    if not libreoffice:
+        raise RuntimeError(
+            "PowerPoint input requires LibreOffice. Install LibreOffice or convert "
+            "the presentation to PDF before running the pipeline."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="vlm-ocr-powerpoint-") as temp_dir:
+        command = [
+            libreoffice,
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            temp_dir,
+            str(source_path.resolve()),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("LibreOffice conversion timed out after 120 seconds.") from exc
+
+        converted_pdf = Path(temp_dir) / f"{source_path.stem}.pdf"
+        if result.returncode != 0 or not converted_pdf.exists():
+            detail = (result.stderr or result.stdout or "unknown conversion error").strip()
+            raise RuntimeError(f"LibreOffice could not convert the presentation: {detail}")
+
+        return render_pdf_to_images(str(converted_pdf), dpi=dpi)
+
+
+def render_document_to_images(input_path: str, dpi: int = 300) -> Tuple[List[bytes], str]:
+    """Render a supported document and return its page images and source type."""
+    extension = Path(input_path).suffix.lower()
+    if extension == ".pdf":
+        return render_pdf_to_images(input_path, dpi=dpi), "pdf"
+    if extension in PRESENTATION_EXTENSIONS:
+        return render_presentation_to_images(input_path, dpi=dpi), "powerpoint"
+    raise ValueError(
+        f"Unsupported document type {extension or '<none>'}. "
+        "Expected .pdf, .ppt, or .pptx."
+    )
 
 def render_pdf_to_images(pdf_path: str, dpi: int = 300) -> List[bytes]:
     """
@@ -132,7 +227,8 @@ def render_pdf_to_images(pdf_path: str, dpi: int = 300) -> List[bytes]:
                         content_rect.x1 = max(content_rect.x1, b.x1)
                         content_rect.y1 = max(content_rect.y1, b.y1)
 
-                    if "lines" not in block: continue
+                    if "lines" not in block:
+                        continue
                     for line in block["lines"]:
                         # Check line direction vector
                         d = line.get("dir", (1, 0))
@@ -188,6 +284,8 @@ class PageResult:
     layout_classification: str
     risk_notes: List[Dict[str, Any]]
     final_markdown: str
+    refinement_passes_executed: int = 0
+    refinement_converged: bool = False
 
 @dataclass
 class UsageTotals:
@@ -225,14 +323,19 @@ class UsageTotals:
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens + self.reasoning_tokens
+        # Provider output-token totals already include reasoning tokens where
+        # the provider reports them as a separate detail field.
+        return self.input_tokens + self.output_tokens
 
 def cost_estimate(usage: UsageTotals, input_price_per_mtok: float, output_price_per_mtok: float) -> float:
     """
-    Simple estimate: input tokens billed at input rate, output (visible + reasoning) at output rate.
+    Estimate input and output token cost using caller-supplied rates.
+
+    Reasoning tokens are an informational subset of output tokens and are not
+    added again.
     """
     in_cost = (usage.input_tokens / 1_000_000.0) * input_price_per_mtok
-    out_cost = ((usage.output_tokens + usage.reasoning_tokens) / 1_000_000.0) * output_price_per_mtok
+    out_cost = (usage.output_tokens / 1_000_000.0) * output_price_per_mtok
     return in_cost + out_cost
 
 class JsonNotReturnedError(Exception):
@@ -351,7 +454,7 @@ async def call_model_one_page(
                 # Unescape JSON string
                 try:
                     partial_markdown = json.loads(f'"{partial_markdown}"')
-                except:
+                except json.JSONDecodeError:
                     # If that fails, try basic unescaping
                     partial_markdown = partial_markdown.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
                 
@@ -516,8 +619,8 @@ async def verify_and_fix_page(
 
 # ---------- Orchestrator ----------
 
-async def process_pdf(
-    pdf_path: str,
+async def process_document(
+    input_path: str,
     output_md_path: str,
     output_json_path: str,
     provider_name: str,
@@ -533,7 +636,7 @@ async def process_pdf(
     print("=" * 70)
     print("🚀 Model-Configurable OCR Pipeline - Starting Processing")
     print("=" * 70)
-    print(f"📄 PDF: {pdf_path}")
+    print(f"📄 Document: {input_path}")
     print(f"📝 Output: {output_md_path}")
     print(f"🔌 Provider: {provider_name}")
     print(f"🤖 Model: {model}")
@@ -543,10 +646,12 @@ async def process_pdf(
     print(f"📊 Max Output Tokens: {max_output_tokens:,}")
     print("-" * 70)
     
-    print("\n📖 Step 1/4: Rendering PDF pages to images...")
+    print("\n📖 Step 1/4: Rendering document pages to images...")
     start_time = time.time()
-    images = render_pdf_to_images(pdf_path, dpi=300)
+    images, source_type = render_document_to_images(input_path, dpi=300)
     total_pages = len(images)
+    if total_pages == 0:
+        raise RuntimeError("The input document did not produce any renderable pages.")
     render_time = time.time() - start_time
     print(f"✅ Rendered {total_pages} page(s) in {render_time:.2f}s (300 DPI)")
 
@@ -566,15 +671,18 @@ async def process_pdf(
         page_number = page_idx + 1
         data_url = b64_data_url_png(images[page_idx])
         
-        # Extract table context if available
+        # Extract table context from source PDFs. PowerPoint input is converted
+        # to a temporary PDF only for rendering and is intentionally cleaned up
+        # before provider calls begin.
         table_context = None
-        try:
-            table_context = table_extractor.extract_table_context(pdf_path, page_number)
-            if table_context and progress_callback:
-                progress_callback(f"📋 Page {page_number}: Extracted table context for improved accuracy")
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"⚠️  Page {page_number}: Table extraction warning - {e}")
+        if source_type == "pdf":
+            try:
+                table_context = table_extractor.extract_table_context(input_path, page_number)
+                if table_context and progress_callback:
+                    progress_callback(f"📋 Page {page_number}: Extracted table context for improved accuracy")
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"⚠️  Page {page_number}: Table extraction warning - {e}")
 
         async with semaphore:
             try:
@@ -589,6 +697,7 @@ async def process_pdf(
                     table_context=table_context,
                 )
                 
+                refinement_passes_executed = 0
                 for refinement_pass in range(1, refinement_passes + 1):
                     if not page_result.risk_notes:
                         break
@@ -603,6 +712,10 @@ async def process_pdf(
                         progress_callback=progress_callback,
                     )
                     usage.add(verify_usage)
+                    refinement_passes_executed += 1
+
+                page_result.refinement_passes_executed = refinement_passes_executed
+                page_result.refinement_converged = not bool(page_result.risk_notes)
 
                 results[page_idx] = page_result
                 async with status_lock:
@@ -617,7 +730,7 @@ async def process_pdf(
                     page_number=page_number,
                     layout_classification="error",
                     risk_notes=[{"type": "system_error", "location": "n/a", "description": str(e)}],
-                    final_markdown=f"### Page {page_number}\n\n**Error**: {e}\n\n(Original page included in the source PDF.)",
+                    final_markdown=f"### Page {page_number}\n\n**Error**: {e}\n\n(Original page included in the source document.)",
                 )
                 results[page_idx] = placeholder
                 progress_callback(f"❌ Page {page_number}: Failed - {str(e)}")
@@ -644,6 +757,12 @@ async def process_pdf(
                 })
 
     # --- Output Generation ---
+
+    estimated_cost = cost_estimate(
+        usage_totals,
+        input_price_per_mtok,
+        output_price_per_mtok,
+    )
     
     # 1. Write JSON Output (Structured Data)
     print(f"\n💾 Step 3a/4: Writing JSON output to {output_json_path}...")
@@ -654,7 +773,9 @@ async def process_pdf(
                 "page_number": res.page_number,
                 "layout_classification": res.layout_classification,
                 "risk_notes": res.risk_notes,
-                "final_markdown": res.final_markdown
+                "final_markdown": res.final_markdown,
+                "refinement_passes_executed": res.refinement_passes_executed,
+                "refinement_converged": res.refinement_converged,
             })
         else:
             json_output.append(None)
@@ -664,15 +785,28 @@ async def process_pdf(
             {
                 "pages": json_output,
                 "metadata": {
-                    "source_pdf": pdf_path,
+                    "source_file": os.path.basename(input_path),
+                    "source_type": source_type,
                     "provider": provider_name,
                     "model": model,
+                    "usage": {
+                        "input_tokens": usage_totals.input_tokens,
+                        "output_tokens": usage_totals.output_tokens,
+                        "reasoning_tokens": usage_totals.reasoning_tokens,
+                        "total_tokens": usage_totals.total_tokens,
+                        "api_calls": usage_totals.api_calls,
+                        "repair_calls": usage_totals.repair_calls,
+                        "refinement_calls": usage_totals.verification_calls,
+                    },
+                    "cost_estimate": estimated_cost,
+                    "input_price_per_mtok": input_price_per_mtok,
+                    "output_price_per_mtok": output_price_per_mtok,
                 },
             },
             f,
             indent=2,
         )
-    print(f"✅ JSON written successfully")
+    print("✅ JSON written successfully")
 
     # 2. Write Markdown Output (Readable Document)
     print(f"\n💾 Step 3b/4: Writing Markdown output to {output_md_path}...")
@@ -683,11 +817,11 @@ async def process_pdf(
             f.write(f"### Page {res.page_number}\n\n")
             f.write(res.final_markdown.strip())
             f.write("\n\n-----\n")
-    print(f"✅ Markdown written successfully")
+    print("✅ Markdown written successfully")
 
     # Summarize tokens & cost
     total_time = time.time() - start_time
-    print(f"\n📊 Step 4/4: Usage Summary")
+    print("\n📊 Step 4/4: Usage Summary")
     print("=" * 70)
     print(f"📄 Pages processed:     {total_pages}")
     print(f"⏱️  Total time:          {total_time:.2f}s ({total_time/60:.1f} min)")
@@ -708,8 +842,7 @@ async def process_pdf(
     print(f"   • Total tokens:        {usage_totals.total_tokens:,}")
     print(f"   • Avg tokens/page:     {usage_totals.total_tokens // total_pages:,}")
     print()
-    est_cost = cost_estimate(usage_totals, input_price_per_mtok, output_price_per_mtok)
-    print(f"💰 Estimated cost:       ${est_cost:,.4f}")
+    print(f"💰 Estimated cost:       ${estimated_cost:,.4f}")
     print(f"   (Input: ${input_price_per_mtok}/M, Output: ${output_price_per_mtok}/M)")
     print("=" * 70)
 
@@ -736,14 +869,23 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python ocr.py --pdf document.pdf
-  python ocr.py --provider openai --model gpt-5.2 --pdf doc.pdf
-  python ocr.py --provider anthropic --model claude-sonnet-4-6 --pdf doc.pdf
-  python ocr.py --pdf dense.pdf --refinement-passes 3
-  python ocr.py --model anthropic:claude-sonnet-4-6 --pdf doc.pdf
+  python ocr.py --file document.pdf
+  python ocr.py --file presentation.pptx
+  python ocr.py --provider openai --model gpt-5.2 --file doc.pdf
+  python ocr.py --provider anthropic --model claude-sonnet-4-6 --file doc.pdf
+  python ocr.py --file dense.pdf --refinement-passes 3
+  python ocr.py --model anthropic:claude-sonnet-4-6 --file doc.pdf
         """
     )
-    p.add_argument("--pdf", required=True, help="Path to input PDF file")
+    input_group = p.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--file",
+        help="Path to an input PDF or PowerPoint (.pdf, .ppt, .pptx) file",
+    )
+    input_group.add_argument(
+        "--pdf",
+        help="Deprecated alias for --file when processing a PDF",
+    )
     p.add_argument("--out", default="output.md", help="Path to Markdown output file (default: output.md)")
     p.add_argument("--json", default="output.json", help="Path to JSON output file (default: output.json)")
     p.add_argument(
@@ -775,7 +917,7 @@ def main():
     """
     Main entry point for the OCR pipeline.
     
-    Loads environment variables, parses arguments, and runs the PDF processing pipeline.
+    Loads environment variables, parses arguments, and runs the document pipeline.
     """
     # Check Python version
     if sys.version_info < (3, 10):
@@ -786,13 +928,23 @@ def main():
     load_dotenv()
     args = parse_args()
 
-    # Validate PDF file exists
-    if not os.path.exists(args.pdf):
-        print(f"ERROR: PDF file not found: {args.pdf}", file=sys.stderr)
+    input_path = args.file or args.pdf
+
+    if not os.path.exists(input_path):
+        print(f"ERROR: Document not found: {input_path}", file=sys.stderr)
         sys.exit(1)
-    
-    if not args.pdf.lower().endswith('.pdf'):
-        print(f"WARNING: File does not have .pdf extension: {args.pdf}", file=sys.stderr)
+
+    extension = Path(input_path).suffix.lower()
+    if args.pdf and extension != ".pdf":
+        print("ERROR: --pdf only accepts .pdf files; use --file for PowerPoint input.", file=sys.stderr)
+        sys.exit(1)
+    if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
+        print(
+            f"ERROR: Unsupported document type {extension or '<none>'}. "
+            "Expected .pdf, .ppt, or .pptx.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.refinement_passes < 0:
         print("ERROR: --refinement-passes must be >= 0", file=sys.stderr)
@@ -810,10 +962,10 @@ def main():
 
     provider_prefix = provider_name.upper()
     input_price = float(
-        os.getenv(f"{provider_prefix}_INPUT_PRICE_PER_MTOK", os.getenv("INPUT_PRICE_PER_MTOK", "1.25"))
+        os.getenv(f"{provider_prefix}_INPUT_PRICE_PER_MTOK", os.getenv("INPUT_PRICE_PER_MTOK", "1.75"))
     )
     output_price = float(
-        os.getenv(f"{provider_prefix}_OUTPUT_PRICE_PER_MTOK", os.getenv("OUTPUT_PRICE_PER_MTOK", "10.0"))
+        os.getenv(f"{provider_prefix}_OUTPUT_PRICE_PER_MTOK", os.getenv("OUTPUT_PRICE_PER_MTOK", "14.0"))
     )
 
     # Ensure output directories exist
@@ -823,8 +975,8 @@ def main():
     json_dir = os.path.dirname(os.path.abspath(args.json)) or "."
     os.makedirs(json_dir, exist_ok=True)
 
-    asyncio.run(process_pdf(
-        pdf_path=args.pdf,
+    asyncio.run(process_document(
+        input_path=input_path,
         output_md_path=args.out,
         output_json_path=args.json,
         provider_name=provider_name,
